@@ -2,11 +2,14 @@
 .env
 .env.*
 !.env.example
+.envrc
 *.pem
 *.key
 *credential*
 *secret*
 *token*
+.pypirc
+.streamlit/secrets.toml
 
 # --- Byte-compiled / cache ---
 __pycache__/
@@ -14,8 +17,13 @@ __pycache__/
 *$py.class
 *.so
 .mypy_cache/
+.dmypy.json
+dmypy.json
 .pytest_cache/
 .ruff_cache/
+.pyre/
+.pytype/
+cython_debug/
 
 # --- Virtual environments ---
 venv/
@@ -30,6 +38,17 @@ build/
 dist/
 *.egg-info/
 .eggs/
+develop-eggs/
+downloads/
+lib/
+lib64/
+parts/
+sdist/
+wheels/
+share/python-wheels/
+.installed.cfg
+*.egg
+MANIFEST
 
 # --- Logs ---
 *.log
@@ -39,6 +58,7 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+*.sqlite3-journal
 *.sql
 *.sql.gz
 backups/
@@ -49,11 +69,37 @@ backups/
 *.tmp
 *.swp
 *~
+tempCodeRunnerFile.py
+
+# --- Test / coverage ---
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+cover/
+
+# --- Jupyter / IPython ---
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
 
 # --- Runtime state ---
 .alert_state_*
+celerybeat-schedule
+celerybeat.pid
+*.pid
 
 # --- OS / editor ---
 .DS_Store
 .idea/
 .vscode/
+.spyderproject
+.spyproject
+.ropeproject
