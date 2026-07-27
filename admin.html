@@ -1,0 +1,1902 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digital Hub — Admin</title>
+<!-- Self-hosted, not loaded from a third-party CDN: unpkg.com/cdn.tailwindcss.com
+     are blocked by some ISPs/mobile carriers and DNS filters, which left the
+     panel blank for affected admins with no visible error. -->
+<script src="/admin-vendor/tailwind.js"></script>
+<script crossorigin src="/admin-vendor/react.production.min.js"></script>
+<script crossorigin src="/admin-vendor/react-dom.production.min.js"></script>
+<script src="/admin-vendor/babel.min.js"></script>
+<style>
+  body { background:#0a0a0b; color:#e5e5e7; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  ::-webkit-scrollbar { width:8px; height:8px }
+  ::-webkit-scrollbar-track { background:#131316 }
+  ::-webkit-scrollbar-thumb { background:#2c2c33; border-radius:4px }
+  ::-webkit-scrollbar-thumb:hover { background:#3d3d46 }
+  input, select, textarea { color-scheme: dark }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+/* ===========================================================================
+   API LAYER
+   The Python server sends money as STRINGS (e.g. "49.99") on purpose --
+   JS Number cannot hold NUMERIC(18,6) exactly. Everything here treats money
+   as a string and only converts for display. Never do arithmetic on these
+   in JS; ask the server instead.
+   =========================================================================== */
+
+const API = (() => {
+  // Same-origin by default. Override by setting window.API_BASE before load.
+  let base = window.API_BASE || "";
+  const tokenKey = "dh_admin_token";
+
+  const getToken = () => localStorage.getItem(tokenKey);
+  const setToken = (t) => t ? localStorage.setItem(tokenKey, t) : localStorage.removeItem(tokenKey);
+
+  async function req(path, opts = {}) {
+    const headers = { ...(opts.headers || {}) };
+    if (opts.body && typeof opts.body === "object") {
+      headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(opts.body);
+    }
+    const tk = getToken();
+    if (tk) headers["Authorization"] = `Bearer ${tk}`;
+
+    const res = await fetch(`${base}/api${path}`, { ...opts, headers });
+
+    if (res.status === 401) {
+      setToken(null);
+      window.dispatchEvent(new Event("dh:logout"));
+      throw new Error("Session expired — please sign in again.");
+    }
+    if (res.status === 204) return null;
+
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+
+    if (!res.ok) {
+      const msg = (data && (data.detail || data.message)) || `HTTP ${res.status}`;
+      throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    }
+    return data;
+  }
+
+  return {
+    getToken, setToken,
+    setBase: (b) => { base = b; },
+    get: (p) => req(p),
+    post: (p, body) => req(p, { method: "POST", body }),
+    patch: (p, body) => req(p, { method: "PATCH", body }),
+    del: (p) => req(p, { method: "DELETE" }),
+    fileUrl: (fid) => `${base}/api/admin/file/${fid}?token=${encodeURIComponent(getToken() || "")}`,
+    exportUrl: (what) => `${base}/api/admin/export/${what}?token=${encodeURIComponent(getToken() || "")}`,
+  };
+})();
+
+/* --- money display: string in, formatted string out, no float math --- */
+function inr(v) {
+  if (v === null || v === undefined || v === "") return "₹0.00";
+  const n = Number(v);
+  if (!isFinite(n)) return `₹${v}`;
+  return "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function num(v) {
+  const n = Number(v ?? 0);
+  return isFinite(n) ? n.toLocaleString("en-IN") : String(v);
+}
+function when(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  return d.toLocaleString("en-IN", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" });
+}
+
+/* ===========================================================================
+   PRIMITIVES
+   =========================================================================== */
+
+const Card = ({ children, className="" }) =>
+  <div className={`bg-[#131316] border border-[#26262c] rounded-xl ${className}`}>{children}</div>;
+
+const Btn = ({ children, onClick, variant="primary", size="md", disabled, className="", type="button" }) => {
+  const v = {
+    primary: "bg-indigo-600 hover:bg-indigo-500 text-white",
+    ghost:   "bg-transparent hover:bg-[#1e1e24] text-neutral-300 border border-[#2c2c33]",
+    danger:  "bg-red-600/90 hover:bg-red-600 text-white",
+    ok:      "bg-emerald-600 hover:bg-emerald-500 text-white",
+  }[variant];
+  const s = { sm:"px-2.5 py-1 text-xs", md:"px-3.5 py-2 text-sm" }[size];
+  return <button type={type} onClick={onClick} disabled={disabled}
+    className={`${v} ${s} rounded-lg font-medium transition disabled:opacity-40 disabled:cursor-not-allowed ${className}`}>
+    {children}</button>;
+};
+
+const Input = (props) =>
+  <input {...props} className={`w-full bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-sm
+    focus:outline-none focus:border-indigo-500 transition ${props.className||""}`} />;
+
+const Select = ({ children, ...p }) =>
+  <select {...p} className={`w-full bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-sm
+    focus:outline-none focus:border-indigo-500 ${p.className||""}`}>{children}</select>;
+
+const Badge = ({ children, tone="gray" }) => {
+  const t = {
+    gray:"bg-neutral-700/40 text-neutral-300", green:"bg-emerald-500/15 text-emerald-400",
+    amber:"bg-amber-500/15 text-amber-400", red:"bg-red-500/15 text-red-400",
+    blue:"bg-blue-500/15 text-blue-400", violet:"bg-violet-500/15 text-violet-400",
+  }[tone];
+  return <span className={`${t} px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap`}>{children}</span>;
+};
+
+const statusTone = (s) => ({
+  delivered:"green", paid:"blue", approved:"green", processing:"violet",
+  pending:"amber", cancelled:"gray", rejected:"red", expired:"gray", failed:"red",
+}[s] || "gray");
+
+const Spinner = () =>
+  <div className="flex justify-center py-12">
+    <div className="w-6 h-6 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"/>
+  </div>;
+
+const Empty = ({ text="Nothing here yet." }) =>
+  <div className="text-center py-12 text-neutral-500 text-sm">{text}</div>;
+
+function Modal({ open, onClose, title, children, wide }) {
+  useEffect(() => {
+    const esc = (e) => e.key === "Escape" && onClose();
+    if (open) window.addEventListener("keydown", esc);
+    return () => window.removeEventListener("keydown", esc);
+  }, [open, onClose]);
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70" onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()}
+        className={`bg-[#131316] border border-[#26262c] rounded-xl w-full ${wide?"max-w-3xl":"max-w-lg"} max-h-[88vh] overflow-y-auto`}>
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-[#26262c] sticky top-0 bg-[#131316]">
+          <h3 className="font-semibold">{title}</h3>
+          <button onClick={onClose} className="text-neutral-500 hover:text-neutral-200 text-xl leading-none">×</button>
+        </div>
+        <div className="p-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/* toast */
+const ToastCtx = React.createContext(()=>{});
+function ToastHost({ children }) {
+  const [items, setItems] = useState([]);
+  const push = useCallback((msg, tone="ok") => {
+    const id = Math.random();
+    setItems(x => [...x, { id, msg, tone }]);
+    setTimeout(() => setItems(x => x.filter(i => i.id !== id)), 4200);
+  }, []);
+  return (
+    <ToastCtx.Provider value={push}>
+      {children}
+      <div className="fixed bottom-5 right-5 z-[60] space-y-2">
+        {items.map(i =>
+          <div key={i.id} className={`px-4 py-2.5 rounded-lg text-sm shadow-lg border animate-in
+            ${i.tone==="err" ? "bg-red-950 border-red-800 text-red-200" : "bg-emerald-950 border-emerald-800 text-emerald-200"}`}>
+            {i.msg}
+          </div>)}
+      </div>
+    </ToastCtx.Provider>
+  );
+}
+const useToast = () => React.useContext(ToastCtx);
+
+/* data hook */
+function useApi(path, deps=[]) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const load = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try { setData(await API.get(path)); }
+    catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  }, [path]);
+  useEffect(() => { load(); }, deps);
+  return { data, loading, err, reload: load };
+}
+
+/* ===========================================================================
+   LOGIN
+   =========================================================================== */
+
+function Login({ onIn }) {
+  const [u, setU] = useState("admin");
+  const [p, setP] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const go = async () => {
+    setBusy(true); setErr("");
+    try {
+      const r = await API.post("/admin/login", { username: u, password: p });
+      API.setToken(r.token);
+      onIn(r.admin);
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4">
+      <Card className="w-full max-w-sm p-7">
+        <div className="text-center mb-6">
+          <div className="text-3xl mb-2">🏪</div>
+          <h1 className="text-xl font-semibold">Digital Hub</h1>
+          <p className="text-neutral-500 text-sm mt-1">Admin panel</p>
+        </div>
+        <div className="space-y-3">
+          <div>
+            <label className="text-xs text-neutral-400 mb-1.5 block">Username</label>
+            <Input value={u} onChange={e=>setU(e.target.value)} autoFocus/>
+          </div>
+          <div>
+            <label className="text-xs text-neutral-400 mb-1.5 block">Password</label>
+            <Input type="password" value={p} onChange={e=>setP(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&go()}/>
+          </div>
+          {err && <div className="text-red-400 text-xs bg-red-950/40 border border-red-900/50 rounded-lg px-3 py-2">{err}</div>}
+          <Btn onClick={go} disabled={busy||!p} className="w-full">
+            {busy ? "Signing in…" : "Sign in"}
+          </Btn>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ===========================================================================
+   DASHBOARD
+   =========================================================================== */
+
+function Stat({ label, value, sub, tone="text-neutral-100" }) {
+  return (
+    <Card className="p-4">
+      <div className="text-xs text-neutral-500">{label}</div>
+      <div className={`text-2xl font-semibold mt-1 ${tone}`}>{value}</div>
+      {sub && <div className="text-xs text-neutral-500 mt-0.5">{sub}</div>}
+    </Card>
+  );
+}
+
+function Dashboard() {
+  const { data, loading, err } = useApi("/admin/stats");
+  if (loading) return <Spinner/>;
+  if (err) return <Card className="p-4 text-red-400 text-sm">{err}</Card>;
+  const s = data;
+
+  const series = s.revenueSeries || [];
+  const vals = series.map(p => Number(p.amount) || 0);
+  const max = Math.max(...vals, 1);
+
+  return (
+    <div className="space-y-5">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <Stat label="Revenue (all time)" value={inr(s.revenue)} sub={`${inr(s.revenue24h)} in last 24h`}/>
+        <Stat label="Orders" value={num(s.totalOrders)} sub={`${num(s.pendingOrders)} pending`}/>
+        <Stat label="Users" value={num(s.totalUsers)} sub={`+${num(s.newUsers24h)} today`}/>
+        <Stat label="Pending payments" value={num(s.pendingPayments)}
+          tone={s.pendingPayments>0?"text-amber-400":"text-neutral-100"}
+          sub={s.pendingPayments>0?"needs review":"all clear"}/>
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-3">
+        <Card className="p-4 lg:col-span-2">
+          <div className="text-sm font-medium mb-3">Revenue — last 30 days</div>
+          {series.length === 0 ? <Empty text="No revenue yet."/> :
+            <div className="flex items-end gap-1 h-40">
+              {series.map((p,i)=>(
+                <div key={i} className="flex-1 group relative">
+                  <div className="bg-indigo-600/70 hover:bg-indigo-500 rounded-t transition-all"
+                       style={{height:`${Math.max(2,(Number(p.amount)/max)*150)}px`}}/>
+                  <div className="hidden group-hover:block absolute bottom-full mb-1 left-1/2 -translate-x-1/2
+                       bg-black text-xs px-2 py-1 rounded whitespace-nowrap z-10 border border-[#2c2c33]">
+                    {p.date}: {inr(p.amount)}
+                  </div>
+                </div>))}
+            </div>}
+        </Card>
+
+        <Card className="p-4">
+          <div className="text-sm font-medium mb-3">Wallet liability</div>
+          <div className="text-2xl font-semibold text-amber-400">{inr(s.walletLiability)}</div>
+          <p className="text-xs text-neutral-500 mt-2 leading-relaxed">
+            Total unspent user balance. This is money you owe as goods, not profit.
+          </p>
+          <div className="mt-4 pt-4 border-t border-[#26262c]">
+            <div className="text-xs text-neutral-500">Active products</div>
+            <div className="text-lg font-medium">{num(s.activeProducts)}</div>
+          </div>
+        </Card>
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        <Card className="p-4">
+          <div className="text-sm font-medium mb-3">Top sellers</div>
+          {(s.topProducts||[]).length===0 ? <Empty/> :
+            <div className="space-y-2">
+              {s.topProducts.map(p=>(
+                <div key={p.id} className="flex justify-between text-sm py-1.5 border-b border-[#1e1e24] last:border-0">
+                  <span className="truncate mr-3">{p.name}</span>
+                  <span className="text-neutral-400 whitespace-nowrap">{p.sold} · {inr(p.revenue)}</span>
+                </div>))}
+            </div>}
+        </Card>
+
+        <Card className="p-4">
+          <div className="text-sm font-medium mb-3">Low stock</div>
+          {(s.lowStock||[]).length===0 ? <Empty/> :
+            <div className="space-y-2">
+              {s.lowStock.map(p=>(
+                <div key={p.id} className="flex justify-between text-sm py-1.5 border-b border-[#1e1e24] last:border-0">
+                  <span className="truncate mr-3">{p.name}</span>
+                  <Badge tone={p.stock===0?"red":p.stock<5?"amber":"gray"}>{p.stock} left</Badge>
+                </div>))}
+            </div>}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ===========================================================================
+   PAYMENTS  — the page that matters most day to day
+   =========================================================================== */
+
+function Payments() {
+  const [status, setStatus] = useState("pending");
+  const { data, loading, reload } = useApi(`/admin/payments?status=${status}&limit=100`, [status]);
+  const [shot, setShot] = useState(null);
+  const [busy, setBusy] = useState(null);
+  // Ids that have been through an on-chain re-check this session (pass or
+  // fail) -- gates the Approve button below for crypto payments so a stray
+  // click can't rubber-stamp a tx hash that was never actually confirmed.
+  const [rechecked, setRechecked] = useState(new Set());
+  const toast = useToast();
+
+  const act = async (id, decision) => {
+    let note = "";
+    if (decision === "rejected") {
+      note = prompt("Reason for rejection (the user sees this):") || "";
+      if (note === null) return;
+    }
+    setBusy(id);
+    try {
+      const r = await API.patch(`/admin/payments/${id}`, { status: decision, note });
+      toast(decision === "approved"
+        ? `Approved${r.delivered ? ` — ${r.delivered} key(s) delivered` : ""}`
+        : "Payment rejected");
+      reload();
+    } catch (e) { toast(e.message, "err"); }
+    finally { setBusy(null); }
+  };
+
+  const recheck = async (id) => {
+    setBusy(id);
+    try {
+      const r = await API.post(`/admin/payments/${id}/recheck`);
+      toast(r.verified
+        ? `Verified on-chain — ${r.amount} USDT, ${r.confirmations} confirmations`
+        : `Not verified: ${r.reason}`, r.verified ? "ok" : "err");
+      setRechecked(s => new Set(s).add(id));
+      reload();
+    } catch (e) { toast(e.message, "err"); }
+    finally { setBusy(null); }
+  };
+
+  // A crypto payment (has a txId) must be re-checked on-chain at least once
+  // in this session before Approve is allowed, and still requires an
+  // explicit confirmation naming the risk -- this is exactly the gap that
+  // let fabricated tx hashes get approved with a single unguarded click.
+  const approve = (p) => {
+    if (p.txId && !rechecked.has(p.id)) {
+      return toast("Re-check this on-chain first — approving an unverified tx hash can hand out real value for free.", "err");
+    }
+    if (p.txId && !confirm(
+      "This transaction did not verify on-chain. Only approve if you've personally " +
+      "confirmed it on a block explorer. Continue anyway?"
+    )) return;
+    return act(p.id, "approved");
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-2 flex-wrap">
+        {["pending","approved","rejected","expired",""].map(s=>(
+          <Btn key={s} size="sm" variant={status===s?"primary":"ghost"} onClick={()=>setStatus(s)}>
+            {s || "all"}
+          </Btn>))}
+      </div>
+
+      {loading ? <Spinner/> : (data?.items||[]).length===0 ? <Empty text="No payments in this state."/> :
+        <div className="space-y-2">
+          {data.items.map(p=>(
+            <Card key={p.id} className="p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap mb-1.5">
+                    <span className="font-medium">#{p.id}</span>
+                    <Badge tone={statusTone(p.status)}>{p.status}</Badge>
+                    <Badge tone="blue">{p.method}</Badge>
+                    {p.purpose==="topup" && <Badge tone="violet">top-up</Badge>}
+                    {p.verification==="chain" && <Badge tone="green">auto-verify</Badge>}
+                    {p.verification==="manual" && <Badge tone="amber">manual</Badge>}
+                  </div>
+                  <div className="text-sm text-neutral-400">
+                    {p.firstName || p.username || p.telegramId}
+                    {p.orderId && <> · order #{p.orderId}</>}
+                    {" · "}{when(p.createdAt)}
+                  </div>
+                  {p.expectedAmount &&
+                    <div className="text-xs text-neutral-500 mt-1">
+                      expects <span className="text-neutral-300">{p.expectedAmount} USDT</span>
+                      {p.chain && <> on {p.chain}</>}
+                    </div>}
+                  {p.txId &&
+                    <div className="text-xs text-neutral-500 mt-1 font-mono break-all">
+                      {p.txId}
+                    </div>}
+                  {p.verifyNote &&
+                    <div className="text-xs mt-1.5 text-amber-400/80">
+                      {p.verifyNote}
+                      {p.confirmations != null && ` (${p.confirmations} confs)`}
+                    </div>}
+                </div>
+
+                <div className="text-right shrink-0">
+                  <div className="text-lg font-semibold">{inr(p.amount)}</div>
+                  {p.status==="pending" &&
+                    <div className="flex gap-1.5 mt-2 flex-wrap justify-end">
+                      {p.screenshotFileId &&
+                        <Btn size="sm" variant="ghost" onClick={()=>setShot(p.screenshotFileId)}>📷</Btn>}
+                      {p.txId &&
+                        <Btn size="sm" variant="ghost" disabled={busy===p.id}
+                          onClick={()=>recheck(p.id)}>recheck</Btn>}
+                      <Btn size="sm" variant="danger" disabled={busy===p.id}
+                        onClick={()=>act(p.id,"rejected")}>reject</Btn>
+                      <Btn size="sm" variant="ok" disabled={busy===p.id}
+                        onClick={()=>approve(p)}>approve</Btn>
+                    </div>}
+                </div>
+              </div>
+            </Card>))}
+        </div>}
+
+      <Modal open={!!shot} onClose={()=>setShot(null)} title="Payment screenshot" wide>
+        {shot && <img src={API.fileUrl(shot)} className="w-full rounded-lg" alt="proof"/>}
+        <p className="text-xs text-amber-400/70 mt-3">
+          Screenshots are easy to fake. Prefer the on-chain recheck when a transaction hash exists.
+        </p>
+      </Modal>
+    </div>
+  );
+}
+
+/* ===========================================================================
+   ORDERS
+   =========================================================================== */
+
+function Orders() {
+  const [status, setStatus] = useState("");
+  const { data, loading, reload } = useApi(`/admin/orders?status=${status}&limit=100`, [status]);
+  const [deliver, setDeliver] = useState(null);
+  const [content, setContent] = useState("");
+  const [view, setView] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [shot, setShot] = useState(null);
+  const toast = useToast();
+
+  const send = async () => {
+    try {
+      await API.patch(`/admin/orders/${deliver.id}`, { deliveredContent: content });
+      toast("Delivered to the user");
+      setDeliver(null); setContent(""); reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  const openView = async (o) => {
+    setView(o); setDetail(null); setDetailLoading(true);
+    try { setDetail(await API.get(`/admin/orders/${o.id}`)); }
+    catch (e) { toast(e.message, "err"); }
+    finally { setDetailLoading(false); }
+  };
+
+  const activate = async (oid) => {
+    try {
+      await API.post(`/admin/orders/${oid}/activate`);
+      toast("Activated — buyer notified");
+      setDetail(await API.get(`/admin/orders/${oid}`)); reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-2 flex-wrap items-center">
+        {["","pending","paid","processing","delivered","cancelled"].map(s=>(
+          <Btn key={s} size="sm" variant={status===s?"primary":"ghost"} onClick={()=>setStatus(s)}>
+            {s||"all"}</Btn>))}
+        <a href={API.exportUrl("orders")} className="ml-auto">
+          <Btn size="sm" variant="ghost">↓ CSV</Btn></a>
+      </div>
+
+      {loading ? <Spinner/> : (data?.items||[]).length===0 ? <Empty/> :
+        <Card className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-neutral-500 border-b border-[#26262c]">
+              <tr><th className="text-left p-3">#</th><th className="text-left p-3">User</th>
+                  <th className="text-left p-3">Product</th><th className="text-right p-3">Qty</th>
+                  <th className="text-right p-3">Total</th><th className="text-left p-3">Status</th>
+                  <th className="text-left p-3">When</th><th className="p-3"></th></tr>
+            </thead>
+            <tbody>
+              {data.items.map(o=>(
+                <tr key={o.id} className="border-b border-[#1e1e24] last:border-0 hover:bg-[#17171b] cursor-pointer"
+                    onClick={()=>openView(o)}>
+                  <td className="p-3 font-mono text-xs">{o.id}</td>
+                  <td className="p-3 truncate max-w-[140px]">{o.firstName||o.username||o.telegramId}</td>
+                  <td className="p-3 truncate max-w-[180px]">{o.productName}</td>
+                  <td className="p-3 text-right">{o.quantity}</td>
+                  <td className="p-3 text-right font-medium">{inr(o.total)}</td>
+                  <td className="p-3"><Badge tone={statusTone(o.status)}>{o.status}</Badge></td>
+                  <td className="p-3 text-neutral-500 text-xs whitespace-nowrap">{when(o.createdAt)}</td>
+                  <td className="p-3 text-right whitespace-nowrap" onClick={e=>e.stopPropagation()}>
+                    <Btn size="sm" variant="ghost" onClick={()=>openView(o)}>view</Btn>{" "}
+                    {(o.status==="processing"||o.status==="paid") &&
+                      <Btn size="sm" variant="ghost" onClick={()=>{setDeliver(o);setContent("");}}>deliver</Btn>}
+                  </td>
+                </tr>))}
+            </tbody>
+          </table>
+        </Card>}
+
+      <Modal open={!!deliver} onClose={()=>setDeliver(null)} title={`Deliver order #${deliver?.id}`}>
+        <p className="text-sm text-neutral-400 mb-3">
+          One key or credential per line. This is sent to the user immediately.
+        </p>
+        <textarea rows={7} value={content} onChange={e=>setContent(e.target.value)}
+          placeholder={"ACCOUNT-1: user@mail / pass\nACCOUNT-2: ..."}
+          className="w-full bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-sm font-mono
+                     focus:outline-none focus:border-indigo-500"/>
+        <div className="flex justify-end gap-2 mt-4">
+          <Btn variant="ghost" onClick={()=>setDeliver(null)}>Cancel</Btn>
+          <Btn onClick={send} disabled={!content.trim()}>Send now</Btn>
+        </div>
+      </Modal>
+
+      <Modal open={!!view} onClose={()=>setView(null)} title={`Order #${view?.id}`} wide>
+        {detailLoading ? <Spinner/> : detail && (()=>{
+          const o = detail.order;
+          return (
+            <div className="space-y-5">
+              <div className="grid sm:grid-cols-2 gap-4">
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Buyer</div>
+                  <div className="text-sm">{o.firstName||"—"} {o.username && <span className="text-neutral-500">@{o.username}</span>}</div>
+                  <div className="text-xs font-mono text-neutral-500">{o.telegramId}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Status</div>
+                  <Badge tone={statusTone(o.status)}>{o.status}</Badge>
+                </div>
+              </div>
+
+              <div className="grid sm:grid-cols-2 gap-4">
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Product</div>
+                  <div className="text-sm">{o.productName} × {o.quantity}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Amount</div>
+                  <div className="text-sm">
+                    subtotal {inr(o.subtotal)}
+                    {Number(o.discount) > 0 && <> · discount {inr(o.discount)}</>}
+                    {" · "}<span className="font-medium">{inr(o.total)}</span> total
+                  </div>
+                  {o.couponCode && <div className="text-xs text-neutral-500">coupon: {o.couponCode}</div>}
+                </div>
+              </div>
+
+              <div className="grid sm:grid-cols-3 gap-4">
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Delivery type</div>
+                  <div className="text-sm">{o.deliveryType}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Ordered</div>
+                  <div className="text-sm">{when(o.createdAt)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Delivered</div>
+                  <div className="text-sm">{when(o.deliveredAt)}</div>
+                </div>
+              </div>
+
+              {o.deliveredContent && (
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Delivered content</div>
+                  <pre className="bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-xs
+                                   whitespace-pre-wrap break-all">{o.deliveredContent}</pre>
+                </div>
+              )}
+
+              {(o.manualInfo || o.manualInfoPhoto) && (
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Manual delivery — buyer submitted</div>
+                  {o.manualInfo &&
+                    <pre className="bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-xs
+                                     whitespace-pre-wrap break-all">{o.manualInfo}</pre>}
+                  <div className="flex gap-2 mt-2">
+                    {o.manualInfoPhoto &&
+                      <Btn size="sm" variant="ghost" onClick={()=>setShot(o.manualInfoPhoto)}>📷 View photo</Btn>}
+                    {o.status==="processing" &&
+                      <Btn size="sm" variant="ok" onClick={()=>activate(o.id)}>✅ Mark activated</Btn>}
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <div className="text-xs text-neutral-500 mb-2">Payments</div>
+                {(detail.payments||[]).length===0 ? <div className="text-sm text-neutral-500">None recorded.</div> :
+                  <div className="space-y-2">
+                    {detail.payments.map(p=>(
+                      <div key={p.id} className="bg-[#0f0f12] border border-[#2c2c33] rounded-lg p-3 text-xs">
+                        <div className="flex items-center gap-2 flex-wrap mb-1">
+                          <Badge tone="blue">{p.method}</Badge>
+                          <Badge tone={statusTone(p.status)}>{p.status}</Badge>
+                          <span className="font-medium text-sm">{inr(p.amount)}</span>
+                          <span className="text-neutral-500 ml-auto">{when(p.createdAt)}</span>
+                        </div>
+                        {p.txId && <div className="font-mono break-all text-neutral-400">{p.txId}
+                          {p.chain && ` (${p.chain})`}</div>}
+                        {p.verifyNote && <div className="text-amber-400/80 mt-1">{p.verifyNote}</div>}
+                        {p.screenshotFileId &&
+                          <Btn size="sm" variant="ghost" className="mt-2"
+                            onClick={()=>setShot(p.screenshotFileId)}>📷 view screenshot</Btn>}
+                      </div>))}
+                  </div>}
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
+
+      <Modal open={!!shot} onClose={()=>setShot(null)} title="Attachment" wide>
+        {shot && <img src={API.fileUrl(shot)} className="w-full rounded-lg" alt="attachment"/>}
+      </Modal>
+    </div>
+  );
+}
+
+/* ===========================================================================
+   PRODUCTS  (+ key import)
+   =========================================================================== */
+
+function Products() {
+  const { data, loading, reload } = useApi("/admin/products?limit=200");
+  const { data: cats } = useApi("/admin/categories");
+  const [edit, setEdit] = useState(null);
+  const [keysFor, setKeysFor] = useState(null);
+  const [keyText, setKeyText] = useState("");
+  const [selected, setSelected] = useState(new Set());
+  const [discount, setDiscount] = useState(null);
+  const toast = useToast();
+
+  const toggleSelect = (id) => setSelected(s => {
+    const n = new Set(s);
+    n.has(id) ? n.delete(id) : n.add(id);
+    return n;
+  });
+
+  const applyDiscount = async (action) => {
+    const targetIds = discount.scope === "category"
+      ? [discount.categoryId]
+      : Array.from(selected);
+    if (!targetIds.length) return toast("Nothing to apply to", "err");
+    try {
+      const r = await API.post("/admin/products/bulk-discount", {
+        scope: discount.scope, targetIds,
+        discountType: discount.discountType, value: String(discount.value || 0), action,
+      });
+      toast(`${r.updated} product${r.updated === 1 ? "" : "s"} updated`);
+      setDiscount(null); setSelected(new Set()); reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  const blank = { categoryId: cats?.[0]?.id || 1, name:"", nameHi:"", description:"", descriptionHi:"",
+    price:"0", originalPrice:null, deliveryType:"auto", active:true, isDeal:false,
+    deliverAsFile:false, manualStock:null, maxPerUser:null, imageUrl:null };
+
+  const save = async () => {
+    const body = { ...edit, price: String(edit.price),
+      originalPrice: edit.originalPrice ? String(edit.originalPrice) : null };
+    try {
+      if (edit.id) await API.patch(`/admin/products/${edit.id}`, body);
+      else await API.post("/admin/products", body);
+      toast("Saved"); setEdit(null); reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  const importKeys = async () => {
+    const keys = keyText.split("\n").map(s=>s.trim()).filter(Boolean);
+    if (!keys.length) return;
+    try {
+      const r = await API.post(`/admin/products/${keysFor.id}/keys`, { keys });
+      toast(`${r.inserted} added${r.duplicates ? `, ${r.duplicates} duplicates skipped` : ""}`);
+      setKeysFor(null); setKeyText(""); reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  const remove = async (p) => {
+    if (!confirm(`Delete "${p.name}"? This also deletes its keys.`)) return;
+    try { await API.del(`/admin/products/${p.id}`); toast("Deleted"); reload(); }
+    catch (e) { toast(e.message, "err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex justify-between items-center flex-wrap gap-2">
+        <div className="text-sm text-neutral-500">
+          {data?.total||0} products{selected.size>0 && ` · ${selected.size} selected`}
+        </div>
+        <div className="flex gap-2">
+          {selected.size>0 &&
+            <Btn variant="ghost" onClick={()=>setDiscount({scope:"products", categoryId:cats?.[0]?.id, discountType:"percent", value:""})}>
+              🏷 Mass discount ({selected.size})
+            </Btn>}
+          <Btn variant="ghost" onClick={()=>setDiscount({scope:"category", categoryId:cats?.[0]?.id, discountType:"percent", value:""})}>
+            🏷 Discount category
+          </Btn>
+          <Btn onClick={()=>setEdit(blank)}>+ New product</Btn>
+        </div>
+      </div>
+
+      {loading ? <Spinner/> : (data?.items||[]).length===0 ? <Empty/> :
+        <div className="grid gap-2 md:grid-cols-2">
+          {data.items.map(p=>(
+            <Card key={p.id} className="p-4">
+              <div className="flex justify-between gap-3">
+                <div className="min-w-0 flex gap-2">
+                  <input type="checkbox" checked={selected.has(p.id)} onChange={()=>toggleSelect(p.id)}
+                    className="accent-indigo-500 mt-1 shrink-0"/>
+                  <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-medium truncate">{p.name}</span>
+                    {!p.active && <Badge tone="gray">off</Badge>}
+                    {p.isDeal && <Badge tone="amber">deal</Badge>}
+                  </div>
+                  <div className="text-xs text-neutral-500 mt-1">
+                    {p.categoryName} · {p.deliveryType}
+                    {" · "}
+                    <span className={
+                      (p.deliveryType==="manual" ? p.manualStock : p.stockCount) > 0
+                        ? "text-emerald-400" : "text-red-400"}>
+                      {p.deliveryType==="manual" ? (p.manualStock ?? "∞") : p.stockCount} in stock
+                    </span>
+                    {p.soldCount>0 && ` · ${p.soldCount} sold`}
+                  </div>
+                  </div>
+                </div>
+                <div className="text-right shrink-0">
+                  <div className="font-semibold">{inr(p.price)}</div>
+                  <div className="flex gap-1 mt-2">
+                    {p.deliveryType==="auto" &&
+                      <Btn size="sm" variant="ghost" onClick={()=>{setKeysFor(p);setKeyText("");}}>keys</Btn>}
+                    <Btn size="sm" variant="ghost" onClick={()=>setEdit(p)}>edit</Btn>
+                    <Btn size="sm" variant="danger" onClick={()=>remove(p)}>×</Btn>
+                  </div>
+                </div>
+              </div>
+            </Card>))}
+        </div>}
+
+      <Modal open={!!edit} onClose={()=>setEdit(null)} title={edit?.id?"Edit product":"New product"}>
+        {edit && <div className="space-y-3">
+          <div><label className="text-xs text-neutral-400 mb-1 block">Name</label>
+            <Input value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/></div>
+          <div><label className="text-xs text-neutral-400 mb-1 block">Description</label>
+            <Input value={edit.description||""} onChange={e=>setEdit({...edit,description:e.target.value})}/></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="text-xs text-neutral-400 mb-1 block">Price (INR)</label>
+              <Input type="number" step="0.01" value={edit.price}
+                onChange={e=>setEdit({...edit,price:e.target.value})}/></div>
+            <div><label className="text-xs text-neutral-400 mb-1 block">Was (optional)</label>
+              <Input type="number" step="0.01" value={edit.originalPrice||""}
+                onChange={e=>setEdit({...edit,originalPrice:e.target.value||null})}/></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="text-xs text-neutral-400 mb-1 block">Category</label>
+              <Select value={edit.categoryId} onChange={e=>setEdit({...edit,categoryId:+e.target.value})}>
+                {(cats||[]).map(c=><option key={c.id} value={c.id}>{c.emoji} {c.name}</option>)}
+              </Select></div>
+            <div><label className="text-xs text-neutral-400 mb-1 block">Delivery</label>
+              <Select value={edit.deliveryType} onChange={e=>setEdit({...edit,deliveryType:e.target.value})}>
+                <option value="auto">auto (from keys)</option>
+                <option value="manual">manual</option>
+              </Select></div>
+          </div>
+          {edit.deliveryType==="manual" &&
+            <div><label className="text-xs text-neutral-400 mb-1 block">Manual stock (blank = unlimited)</label>
+              <Input type="number" value={edit.manualStock??""}
+                onChange={e=>setEdit({...edit,manualStock:e.target.value===""?null:+e.target.value})}/></div>}
+          <div className="flex gap-4 pt-1 text-sm flex-wrap">
+            {[["active","Active"],["isDeal","Deal"],["deliverAsFile","Send as file"]].map(([k,l])=>(
+              <label key={k} className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={!!edit[k]}
+                  onChange={e=>setEdit({...edit,[k]:e.target.checked})} className="accent-indigo-500"/>
+                {l}</label>))}
+          </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <Btn variant="ghost" onClick={()=>setEdit(null)}>Cancel</Btn>
+            <Btn onClick={save} disabled={!edit.name}>Save</Btn>
+          </div>
+        </div>}
+      </Modal>
+
+      <Modal open={!!keysFor} onClose={()=>setKeysFor(null)} title={`Import keys — ${keysFor?.name}`}>
+        <p className="text-sm text-neutral-400 mb-3">
+          One key per line. Duplicates are skipped automatically. If stock was
+          zero, everyone with a restock alert gets notified.
+        </p>
+        <textarea rows={10} value={keyText} onChange={e=>setKeyText(e.target.value)}
+          placeholder={"KEY-AAAA-1111\nKEY-BBBB-2222"}
+          className="w-full bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-sm font-mono
+                     focus:outline-none focus:border-indigo-500"/>
+        <div className="flex items-center justify-between mt-3">
+          <span className="text-xs text-neutral-500">
+            {keyText.split("\n").filter(s=>s.trim()).length} keys
+          </span>
+          <div className="flex gap-2">
+            <Btn variant="ghost" onClick={()=>setKeysFor(null)}>Cancel</Btn>
+            <Btn onClick={importKeys}>Import</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal open={!!discount} onClose={()=>setDiscount(null)} title="Mass discount">
+        {discount && <div className="space-y-3">
+          <div className="flex gap-4 text-sm">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="radio" checked={discount.scope==="products"}
+                onChange={()=>setDiscount({...discount, scope:"products"})} className="accent-indigo-500"/>
+              Selected products ({selected.size})
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="radio" checked={discount.scope==="category"}
+                onChange={()=>setDiscount({...discount, scope:"category"})} className="accent-indigo-500"/>
+              Entire category
+            </label>
+          </div>
+          {discount.scope==="category" &&
+            <Select value={discount.categoryId} onChange={e=>setDiscount({...discount, categoryId:+e.target.value})}>
+              {(cats||[]).map(c=><option key={c.id} value={c.id}>{c.emoji} {c.name}</option>)}
+            </Select>}
+          {discount.scope==="products" && selected.size===0 &&
+            <p className="text-xs text-amber-400">No products selected — check the boxes on product cards first.</p>}
+          <div className="grid grid-cols-2 gap-3">
+            <Select value={discount.discountType} onChange={e=>setDiscount({...discount, discountType:e.target.value})}>
+              <option value="percent">Percent off</option>
+              <option value="fixed">Fixed amount off (INR)</option>
+            </Select>
+            <Input type="number" step="0.01" placeholder={discount.discountType==="percent" ? "e.g. 20" : "e.g. 100"}
+              value={discount.value} onChange={e=>setDiscount({...discount, value:e.target.value})}/>
+          </div>
+          <p className="text-xs text-neutral-500">
+            Discounts always compute from each product's original price, so applying twice never
+            compounds. "Remove discount" restores the original price exactly.
+          </p>
+          <div className="flex justify-end gap-2 pt-2">
+            <Btn variant="ghost" onClick={()=>setDiscount(null)}>Cancel</Btn>
+            <Btn variant="danger" onClick={()=>applyDiscount("remove")}>Remove discount</Btn>
+            <Btn onClick={()=>applyDiscount("apply")} disabled={!discount.value}>Apply</Btn>
+          </div>
+        </div>}
+      </Modal>
+    </div>
+  );
+}
+
+/* ===========================================================================
+   USERS
+   =========================================================================== */
+
+function Users() {
+  const [q, setQ] = useState("");
+  const [term, setTerm] = useState("");
+  const { data, loading, reload } = useApi(`/admin/users?search=${encodeURIComponent(term)}&limit=100`, [term]);
+  const [adj, setAdj] = useState(null);
+  const [amt, setAmt] = useState("");
+  const [note, setNote] = useState("");
+  const [view, setView] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const toast = useToast();
+
+  useEffect(()=>{ const t=setTimeout(()=>setTerm(q),350); return ()=>clearTimeout(t); },[q]);
+
+  const openView = async (u) => {
+    setView(u); setDetail(null); setDetailLoading(true);
+    try { setDetail(await API.get(`/admin/users/${u.id}`)); }
+    catch (e) { toast(e.message, "err"); }
+    finally { setDetailLoading(false); }
+  };
+
+  const ban = async (u) => {
+    const isBan = !u.isBanned;
+    const reason = isBan ? (prompt("Reason (optional):")||"") : null;
+    try {
+      await API.patch(`/admin/users/${u.id}`, { isBanned:isBan, banReason:reason });
+      toast(isBan?"User banned":"User unbanned"); reload();
+    } catch (e) { toast(e.message,"err"); }
+  };
+
+  const adjust = async () => {
+    try {
+      await API.patch(`/admin/users/${adj.id}`, { balanceAdjust: amt, adjustNote: note||"Admin adjustment" });
+      toast("Balance adjusted"); setAdj(null); setAmt(""); setNote(""); reload();
+    } catch (e) { toast(e.message,"err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-2">
+        <Input placeholder="Search name, username, or Telegram ID…" value={q} onChange={e=>setQ(e.target.value)}/>
+        <a href={API.exportUrl("users")}><Btn variant="ghost">↓ CSV</Btn></a>
+      </div>
+
+      {loading ? <Spinner/> : (data?.items||[]).length===0 ? <Empty text="No users found."/> :
+        <Card className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-neutral-500 border-b border-[#26262c]">
+              <tr><th className="text-left p-3">User</th><th className="text-left p-3">Telegram</th>
+                  <th className="text-right p-3">Balance</th><th className="text-right p-3">Spent</th>
+                  <th className="text-left p-3">Tier</th><th className="text-right p-3">Orders</th>
+                  <th className="p-3"></th></tr>
+            </thead>
+            <tbody>
+              {data.items.map(u=>(
+                <tr key={u.id} className="border-b border-[#1e1e24] last:border-0 hover:bg-[#17171b] cursor-pointer"
+                    onClick={()=>openView(u)}>
+                  <td className="p-3">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate max-w-[130px]">{u.firstName||"—"}</span>
+                      {u.isBanned && <Badge tone="red">banned</Badge>}
+                    </div>
+                    {u.username && <div className="text-xs text-neutral-500">@{u.username}</div>}
+                  </td>
+                  <td className="p-3 font-mono text-xs text-neutral-500">{u.telegramId}</td>
+                  <td className="p-3 text-right font-medium">{inr(u.walletBalance)}</td>
+                  <td className="p-3 text-right text-neutral-400">{inr(u.totalSpent)}</td>
+                  <td className="p-3"><Badge tone={u.tier==="gold"?"amber":u.tier==="silver"?"blue":"gray"}>
+                    {u.tier}</Badge></td>
+                  <td className="p-3 text-right">{u.orderCount}</td>
+                  <td className="p-3 text-right whitespace-nowrap" onClick={e=>e.stopPropagation()}>
+                    <Btn size="sm" variant="ghost" onClick={()=>openView(u)}>view</Btn>
+                    {" "}
+                    <Btn size="sm" variant="ghost" onClick={()=>{setAdj(u);setAmt("");setNote("");}}>₹</Btn>
+                    {" "}
+                    <Btn size="sm" variant={u.isBanned?"ok":"danger"} onClick={()=>ban(u)}>
+                      {u.isBanned?"unban":"ban"}</Btn>
+                  </td>
+                </tr>))}
+            </tbody>
+          </table>
+        </Card>}
+
+      <Modal open={!!adj} onClose={()=>setAdj(null)} title={`Adjust balance — ${adj?.firstName||adj?.telegramId}`}>
+        <p className="text-sm text-neutral-400 mb-3">
+          Current: <span className="text-neutral-200">{inr(adj?.walletBalance)}</span>.
+          Use a negative number to deduct. Every adjustment is written to the ledger and audit log.
+        </p>
+        <div className="space-y-3">
+          <Input type="number" step="0.01" placeholder="e.g. 500 or -250"
+            value={amt} onChange={e=>setAmt(e.target.value)}/>
+          <Input placeholder="Note (the user sees this)" value={note} onChange={e=>setNote(e.target.value)}/>
+          <div className="flex justify-end gap-2">
+            <Btn variant="ghost" onClick={()=>setAdj(null)}>Cancel</Btn>
+            <Btn onClick={adjust} disabled={!amt}>Apply</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal open={!!view} onClose={()=>setView(null)}
+        title={`${view?.firstName||view?.telegramId||""} — user detail`} wide>
+        {detailLoading ? <Spinner/> : detail && (()=>{
+          const u = detail.user;
+          return (
+            <div className="space-y-5">
+              <div className="grid sm:grid-cols-3 gap-4">
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Telegram</div>
+                  <div className="text-sm font-mono">{u.telegramId}</div>
+                  {u.username && <div className="text-xs text-neutral-500">@{u.username}</div>}
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Wallet balance</div>
+                  <div className="text-sm font-medium">{inr(u.walletBalance)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Total spent</div>
+                  <div className="text-sm">{inr(u.totalSpent)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Tier</div>
+                  <Badge tone={u.tier==="gold"?"amber":u.tier==="silver"?"blue":"gray"}>{u.tier}</Badge>
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Referral code</div>
+                  <div className="text-sm font-mono">{u.referralCode}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-neutral-500 mb-1">Joined</div>
+                  <div className="text-sm">{when(u.createdAt)}</div>
+                </div>
+              </div>
+
+              <div>
+                <div className="text-xs text-neutral-500 mb-2">Purchases ({(detail.orders||[]).length})</div>
+                {(detail.orders||[]).length===0 ? <div className="text-sm text-neutral-500">No orders yet.</div> :
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead className="text-neutral-500 border-b border-[#26262c]">
+                        <tr><th className="text-left p-2">#</th><th className="text-left p-2">Product</th>
+                            <th className="text-right p-2">Qty</th><th className="text-right p-2">Total</th>
+                            <th className="text-left p-2">Status</th><th className="text-left p-2">When</th></tr>
+                      </thead>
+                      <tbody>
+                        {detail.orders.map(o=>(
+                          <tr key={o.id} className="border-b border-[#1e1e24] last:border-0">
+                            <td className="p-2 font-mono">{o.id}</td>
+                            <td className="p-2 truncate max-w-[160px]">{o.name}</td>
+                            <td className="p-2 text-right">{o.quantity}</td>
+                            <td className="p-2 text-right font-medium">{inr(o.total)}</td>
+                            <td className="p-2"><Badge tone={statusTone(o.status)}>{o.status}</Badge></td>
+                            <td className="p-2 text-neutral-500 whitespace-nowrap">{when(o.createdAt)}</td>
+                          </tr>))}
+                      </tbody>
+                    </table>
+                  </div>}
+              </div>
+
+              <div>
+                <div className="text-xs text-neutral-500 mb-2">Wallet transactions ({(detail.transactions||[]).length})</div>
+                {(detail.transactions||[]).length===0 ? <div className="text-sm text-neutral-500">No transactions yet.</div> :
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead className="text-neutral-500 border-b border-[#26262c]">
+                        <tr><th className="text-left p-2">Type</th><th className="text-right p-2">Amount</th>
+                            <th className="text-right p-2">Balance after</th>
+                            <th className="text-left p-2">Note</th><th className="text-left p-2">When</th></tr>
+                      </thead>
+                      <tbody>
+                        {detail.transactions.map(t=>(
+                          <tr key={t.id} className="border-b border-[#1e1e24] last:border-0">
+                            <td className="p-2"><Badge tone={Number(t.amount)>=0?"green":"red"}>{t.type}</Badge></td>
+                            <td className={`p-2 text-right font-medium ${Number(t.amount)>=0?"text-emerald-400":"text-red-400"}`}>
+                              {Number(t.amount)>=0?"+":""}{inr(t.amount)}</td>
+                            <td className="p-2 text-right text-neutral-400">{inr(t.balanceAfter)}</td>
+                            <td className="p-2 truncate max-w-[200px] text-neutral-400">{t.description}</td>
+                            <td className="p-2 text-neutral-500 whitespace-nowrap">{when(t.createdAt)}</td>
+                          </tr>))}
+                      </tbody>
+                    </table>
+                  </div>}
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
+    </div>
+  );
+}
+
+/* ===========================================================================
+   CATEGORIES / COUPONS / BROADCAST / SETTINGS / AUDIT
+   =========================================================================== */
+
+function Categories() {
+  const { data, loading, reload } = useApi("/admin/categories");
+  const [edit, setEdit] = useState(null);
+  const toast = useToast();
+  const blank = { name:"", nameHi:"", emoji:"📦", sortOrder:0, active:true };
+
+  const save = async () => {
+    try {
+      if (edit.id) await API.patch(`/admin/categories/${edit.id}`, edit);
+      else await API.post("/admin/categories", edit);
+      toast("Saved"); setEdit(null); reload();
+    } catch (e) { toast(e.message,"err"); }
+  };
+  const remove = async (c) => {
+    if (!confirm(`Delete "${c.name}"?`)) return;
+    try { await API.del(`/admin/categories/${c.id}`); toast("Deleted"); reload(); }
+    catch (e) { toast(e.message,"err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex justify-end"><Btn onClick={()=>setEdit(blank)}>+ New category</Btn></div>
+      {loading ? <Spinner/> :
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {(data||[]).map(c=>(
+            <Card key={c.id} className="p-4 flex justify-between items-center">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-lg">{c.emoji}</span>
+                  <span className="font-medium">{c.name}</span>
+                  {!c.active && <Badge tone="gray">off</Badge>}
+                </div>
+                <div className="text-xs text-neutral-500 mt-1">{c.productCount} products</div>
+              </div>
+              <div className="flex gap-1">
+                <Btn size="sm" variant="ghost" onClick={()=>setEdit(c)}>edit</Btn>
+                <Btn size="sm" variant="danger" onClick={()=>remove(c)}>×</Btn>
+              </div>
+            </Card>))}
+        </div>}
+
+      <Modal open={!!edit} onClose={()=>setEdit(null)} title={edit?.id?"Edit category":"New category"}>
+        {edit && <div className="space-y-3">
+          <div className="grid grid-cols-4 gap-3">
+            <div><label className="text-xs text-neutral-400 mb-1 block">Emoji</label>
+              <Input value={edit.emoji} onChange={e=>setEdit({...edit,emoji:e.target.value})}/></div>
+            <div className="col-span-3"><label className="text-xs text-neutral-400 mb-1 block">Name</label>
+              <Input value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/></div>
+          </div>
+          <div><label className="text-xs text-neutral-400 mb-1 block">Sort order</label>
+            <Input type="number" value={edit.sortOrder}
+              onChange={e=>setEdit({...edit,sortOrder:+e.target.value})}/></div>
+          <label className="flex items-center gap-2 text-sm cursor-pointer">
+            <input type="checkbox" checked={edit.active} className="accent-indigo-500"
+              onChange={e=>setEdit({...edit,active:e.target.checked})}/> Active</label>
+          <div className="flex justify-end gap-2 pt-1">
+            <Btn variant="ghost" onClick={()=>setEdit(null)}>Cancel</Btn>
+            <Btn onClick={save} disabled={!edit.name}>Save</Btn>
+          </div>
+        </div>}
+      </Modal>
+    </div>
+  );
+}
+
+/* Global Emoji Replacement Manager: one flat unicode-emoji -> premium-emoji-ID
+   dictionary (table: emoji_map). No per-button config — mapping an emoji here
+   makes it render as its Telegram Premium custom emoji everywhere in the bot
+   (messages, captions, buttons) automatically. Same table the bot's own
+   Telegram admin chat "Emoji Mappings" section manages. */
+function EmojiMap() {
+  const { data, loading, reload } = useApi("/admin/emoji-map");
+  const [edit, setEdit] = useState(null);
+  const toast = useToast();
+  const blank = { unicodeEmoji:"", premiumEmojiId:"" };
+
+  const save = async () => {
+    try {
+      await API.post("/admin/emoji-map", edit);
+      toast("Saved"); setEdit(null); reload();
+    } catch (e) { toast(e.message,"err"); }
+  };
+  const remove = async (m) => {
+    if (!confirm(`Remove mapping for ${m.unicodeEmoji}?`)) return;
+    try {
+      await API.del(`/admin/emoji-map/${encodeURIComponent(m.unicodeEmoji)}`);
+      toast("Deleted"); reload();
+    } catch (e) { toast(e.message,"err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex justify-between items-center gap-4 flex-wrap">
+        <p className="text-xs text-neutral-500 max-w-md">
+          Every unicode emoji mapped here renders as its Telegram Premium custom
+          emoji everywhere in the bot. Unmapped emoji show as plain unicode.
+        </p>
+        <Btn onClick={()=>setEdit(blank)}>+ Add mapping</Btn>
+      </div>
+      {loading ? <Spinner/> : (data||[]).length===0 ? <Empty text="No emoji mappings yet."/> :
+        <Card className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-neutral-500 border-b border-[#26262c]">
+              <tr><th className="text-left p-3">Unicode emoji</th>
+                  <th className="text-left p-3">Premium emoji ID</th>
+                  <th className="text-right p-3">Actions</th></tr>
+            </thead>
+            <tbody>
+              {data.map(m=>(
+                <tr key={m.unicodeEmoji} className="border-b border-[#1e1e24] last:border-0">
+                  <td className="p-3 text-lg">{m.unicodeEmoji}</td>
+                  <td className="p-3 font-mono text-xs text-neutral-400">{m.premiumEmojiId}</td>
+                  <td className="p-3 text-right">
+                    <Btn size="sm" variant="ghost" onClick={()=>setEdit(m)}>edit</Btn>{" "}
+                    <Btn size="sm" variant="danger" onClick={()=>remove(m)}>×</Btn>
+                  </td>
+                </tr>))}
+            </tbody>
+          </table>
+        </Card>}
+
+      <Modal open={!!edit} onClose={()=>setEdit(null)} title="Emoji mapping">
+        {edit && <div className="space-y-3">
+          <div><label className="text-xs text-neutral-400 mb-1 block">Unicode emoji</label>
+            <Input value={edit.unicodeEmoji}
+              onChange={e=>setEdit({...edit,unicodeEmoji:e.target.value})}/></div>
+          <div><label className="text-xs text-neutral-400 mb-1 block">Premium emoji ID</label>
+            <Input value={edit.premiumEmojiId}
+              onChange={e=>setEdit({...edit,premiumEmojiId:e.target.value})}/></div>
+          <div className="flex justify-end gap-2 pt-1">
+            <Btn variant="ghost" onClick={()=>setEdit(null)}>Cancel</Btn>
+            <Btn onClick={save} disabled={!edit.unicodeEmoji || !edit.premiumEmojiId}>Save</Btn>
+          </div>
+        </div>}
+      </Modal>
+    </div>
+  );
+}
+
+function Coupons() {
+  const { data, loading, reload } = useApi("/admin/coupons");
+  const [edit, setEdit] = useState(null);
+  const toast = useToast();
+  const blank = { code:"", discountType:"percent", value:"10", maxUses:null,
+    minOrderAmount:"0", perUserLimit:null, expiresAt:null, active:true };
+
+  const save = async () => {
+    try {
+      const body = { ...edit, value:String(edit.value), minOrderAmount:String(edit.minOrderAmount||0) };
+      if (edit.id) await API.patch(`/admin/coupons/${edit.id}`, body);
+      else await API.post("/admin/coupons", body);
+      toast("Saved"); setEdit(null); reload();
+    } catch (e) { toast(e.message,"err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex justify-end"><Btn onClick={()=>setEdit(blank)}>+ New coupon</Btn></div>
+      {loading ? <Spinner/> : (data||[]).length===0 ? <Empty/> :
+        <div className="grid gap-2 sm:grid-cols-2">
+          {data.map(c=>(
+            <Card key={c.id} className="p-4 flex justify-between items-start">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono font-medium">{c.code}</span>
+                  {!c.active && <Badge tone="gray">off</Badge>}
+                </div>
+                <div className="text-xs text-neutral-500 mt-1">
+                  {c.discountType==="percent" ? `${c.value}% off` : `${inr(c.value)} off`}
+                  {" · "}{c.usedCount}{c.maxUses?`/${c.maxUses}`:""} used
+                  {Number(c.minOrderAmount)>0 && ` · min ${inr(c.minOrderAmount)}`}
+                </div>
+              </div>
+              <div className="flex gap-1">
+                <Btn size="sm" variant="ghost" onClick={()=>setEdit(c)}>edit</Btn>
+                <Btn size="sm" variant="danger" onClick={async()=>{
+                  if(!confirm(`Delete ${c.code}?`))return;
+                  await API.del(`/admin/coupons/${c.id}`); toast("Deleted"); reload();
+                }}>×</Btn>
+              </div>
+            </Card>))}
+        </div>}
+
+      <Modal open={!!edit} onClose={()=>setEdit(null)} title={edit?.id?"Edit coupon":"New coupon"}>
+        {edit && <div className="space-y-3">
+          <div><label className="text-xs text-neutral-400 mb-1 block">Code</label>
+            <Input value={edit.code} onChange={e=>setEdit({...edit,code:e.target.value.toUpperCase()})}
+              className="font-mono"/></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="text-xs text-neutral-400 mb-1 block">Type</label>
+              <Select value={edit.discountType} onChange={e=>setEdit({...edit,discountType:e.target.value})}>
+                <option value="percent">Percent</option><option value="fixed">Fixed ₹</option>
+              </Select></div>
+            <div><label className="text-xs text-neutral-400 mb-1 block">Value</label>
+              <Input type="number" step="0.01" value={edit.value}
+                onChange={e=>setEdit({...edit,value:e.target.value})}/></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="text-xs text-neutral-400 mb-1 block">Max uses (blank = ∞)</label>
+              <Input type="number" value={edit.maxUses??""}
+                onChange={e=>setEdit({...edit,maxUses:e.target.value===""?null:+e.target.value})}/></div>
+            <div><label className="text-xs text-neutral-400 mb-1 block">Per user limit</label>
+              <Input type="number" value={edit.perUserLimit??""}
+                onChange={e=>setEdit({...edit,perUserLimit:e.target.value===""?null:+e.target.value})}/></div>
+          </div>
+          <div><label className="text-xs text-neutral-400 mb-1 block">Minimum order (₹)</label>
+            <Input type="number" step="0.01" value={edit.minOrderAmount}
+              onChange={e=>setEdit({...edit,minOrderAmount:e.target.value})}/></div>
+          <label className="flex items-center gap-2 text-sm cursor-pointer">
+            <input type="checkbox" checked={edit.active} className="accent-indigo-500"
+              onChange={e=>setEdit({...edit,active:e.target.checked})}/> Active</label>
+          <div className="flex justify-end gap-2 pt-1">
+            <Btn variant="ghost" onClick={()=>setEdit(null)}>Cancel</Btn>
+            <Btn onClick={save} disabled={!edit.code}>Save</Btn>
+          </div>
+        </div>}
+      </Modal>
+    </div>
+  );
+}
+
+function AudienceSelect({ value, onChange }) {
+  return (
+    <Select value={value} onChange={e=>onChange(e.target.value)}>
+      <option value="all">Everyone</option>
+      <option value="buyers">Has ordered before</option>
+      <option value="no_orders">Never ordered</option>
+      <option value="ids">Specific Telegram IDs…</option>
+    </Select>
+  );
+}
+
+function Broadcast() {
+  const { data, loading, reload } = useApi("/admin/broadcasts");
+  const { data: products } = useApi("/admin/products?limit=200");
+  const toast = useToast();
+
+  const resolveTarget = (t, idsStr) => t === "ids" ? `ids~${idsStr.replace(/\s+/g,"")}` : t;
+  const productName = (id) => (products?.items||[]).find(p=>p.id===id)?.name || `#${id}`;
+
+  // -- plain text/media broadcast --
+  const [msg, setMsg] = useState("");
+  const [target, setTarget] = useState("all");
+  const [ids, setIds] = useState("");
+
+  const send = async () => {
+    const finalTarget = resolveTarget(target, ids);
+    if (target === "ids" && !ids.trim()) return toast("Enter at least one Telegram ID", "err");
+    if (!confirm(`Send this to "${finalTarget}"? This cannot be undone.`)) return;
+    try {
+      await API.post("/admin/broadcasts", { message: msg, target: finalTarget });
+      toast("Broadcast started"); setMsg("");
+      setTimeout(reload, 900);
+    } catch (e) { toast(e.message,"err"); }
+  };
+
+  // -- product broadcast --
+  const [pbProductId, setPbProductId] = useState("");
+  const [pbMsg, setPbMsg] = useState("");
+  const [pbMediaType, setPbMediaType] = useState("photo");
+  const [pbMedia, setPbMedia] = useState("");
+  const [pbTarget, setPbTarget] = useState("all");
+  const [pbIds, setPbIds] = useState("");
+
+  useEffect(() => {
+    if (products?.items?.length && !pbProductId) setPbProductId(products.items[0].id);
+  }, [products]);
+
+  const sendProductBroadcast = async () => {
+    const finalTarget = resolveTarget(pbTarget, pbIds);
+    if (pbTarget === "ids" && !pbIds.trim()) return toast("Enter at least one Telegram ID", "err");
+    if (!pbProductId) return toast("Pick a product", "err");
+    if (!confirm(`Broadcast "${productName(pbProductId)}" to "${finalTarget}"? This cannot be undone.`)) return;
+    try {
+      await API.post("/admin/broadcasts/product", {
+        productId: pbProductId, message: pbMsg,
+        mediaType: pbMediaType, mediaFileId: pbMedia.trim() || null, target: finalTarget,
+      });
+      toast("Product broadcast started"); setPbMsg(""); setPbMedia("");
+      setTimeout(reload, 900);
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-5 space-y-3">
+        <div className="text-sm font-medium">New broadcast</div>
+        <textarea rows={5} value={msg} onChange={e=>setMsg(e.target.value)}
+          placeholder="Message to all users. HTML allowed: <b>bold</b>, <i>italic</i>, <a href=''>link</a>"
+          className="w-full bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-sm
+                     focus:outline-none focus:border-indigo-500"/>
+        <div className="flex gap-3 items-end flex-wrap">
+          <div className="flex-1 min-w-[160px]">
+            <label className="text-xs text-neutral-400 mb-1 block">Audience</label>
+            <AudienceSelect value={target} onChange={setTarget}/>
+          </div>
+          {target === "ids" &&
+            <div className="flex-[2] min-w-[220px]">
+              <label className="text-xs text-neutral-400 mb-1 block">Telegram IDs (comma-separated)</label>
+              <Input value={ids} onChange={e=>setIds(e.target.value)} placeholder="111111,222222"/>
+            </div>}
+          <Btn onClick={send} disabled={!msg.trim()}>Send</Btn>
+        </div>
+        <p className="text-xs text-neutral-500">
+          Sends are paced to respect Telegram limits, so large broadcasts take a few minutes.
+        </p>
+      </Card>
+
+      <Card className="p-5 space-y-3">
+        <div className="text-sm font-medium">🛒 Product broadcast</div>
+        <p className="text-xs text-neutral-500">
+          Promote one product with a custom message, an optional image or video, and a Buy Now
+          button that opens that product directly when tapped.
+        </p>
+        <div>
+          <label className="text-xs text-neutral-400 mb-1 block">Product</label>
+          <Select value={pbProductId} onChange={e=>setPbProductId(+e.target.value)}>
+            {(products?.items||[]).map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+          </Select>
+        </div>
+        <textarea rows={4} value={pbMsg} onChange={e=>setPbMsg(e.target.value)}
+          placeholder="Custom message shown with the product. HTML allowed."
+          className="w-full bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-sm
+                     focus:outline-none focus:border-indigo-500"/>
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <label className="text-xs text-neutral-400 mb-1 block">Attachment</label>
+            <Select value={pbMediaType} onChange={e=>setPbMediaType(e.target.value)}>
+              <option value="photo">Image</option>
+              <option value="video">Video</option>
+              <option value="none">None (text only)</option>
+            </Select>
+          </div>
+          <div className="col-span-2">
+            <label className="text-xs text-neutral-400 mb-1 block">
+              {pbMediaType === "video" ? "Video file ID" : "Image file ID (blank = product's own photo)"}
+            </label>
+            <Input value={pbMedia} onChange={e=>setPbMedia(e.target.value)} className="font-mono text-xs"
+              disabled={pbMediaType === "none"}
+              placeholder={pbMediaType === "video" ? "BAACAgEAAxk..." : "AgACAgEAAxk... (optional)"}/>
+          </div>
+        </div>
+        <div className="flex gap-3 items-end flex-wrap">
+          <div className="flex-1 min-w-[160px]">
+            <label className="text-xs text-neutral-400 mb-1 block">Audience</label>
+            <AudienceSelect value={pbTarget} onChange={setPbTarget}/>
+          </div>
+          {pbTarget === "ids" &&
+            <div className="flex-[2] min-w-[220px]">
+              <label className="text-xs text-neutral-400 mb-1 block">Telegram IDs (comma-separated)</label>
+              <Input value={pbIds} onChange={e=>setPbIds(e.target.value)} placeholder="111111,222222"/>
+            </div>}
+          <Btn onClick={sendProductBroadcast} disabled={!pbMsg.trim() || !pbProductId}>Send</Btn>
+        </div>
+      </Card>
+
+      {loading ? <Spinner/> :
+        <Card className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-neutral-500 border-b border-[#26262c]">
+              <tr><th className="text-left p-3">Message</th><th className="text-left p-3">Product</th>
+                  <th className="text-left p-3">Target</th>
+                  <th className="text-right p-3">Sent</th><th className="text-right p-3">Failed</th>
+                  <th className="text-left p-3">Status</th><th className="text-left p-3">When</th></tr>
+            </thead>
+            <tbody>
+              {(data||[]).map(b=>(
+                <tr key={b.id} className="border-b border-[#1e1e24] last:border-0">
+                  <td className="p-3 truncate max-w-[280px]">{b.message}</td>
+                  <td className="p-3 text-neutral-400">{b.productId ? productName(b.productId) : "—"}</td>
+                  <td className="p-3 text-neutral-400">{b.target}</td>
+                  <td className="p-3 text-right text-emerald-400">{b.sentCount}</td>
+                  <td className="p-3 text-right text-red-400">{b.failedCount}</td>
+                  <td className="p-3"><Badge tone={b.status==="done"?"green":"amber"}>{b.status}</Badge></td>
+                  <td className="p-3 text-xs text-neutral-500">{when(b.createdAt)}</td>
+                </tr>))}
+            </tbody>
+          </table>
+        </Card>}
+    </div>
+  );
+}
+
+function Tickets() {
+  const [status, setStatus] = useState("open");
+  const { data, loading, reload } = useApi(`/admin/tickets?status=${status}&limit=100`, [status]);
+  const [view, setView] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [reply, setReply] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const toast = useToast();
+
+  const openView = async (tk) => {
+    setView(tk); setDetail(null); setDetailLoading(true); setReply("");
+    try { setDetail(await API.get(`/admin/tickets/${tk.id}`)); }
+    catch (e) { toast(e.message, "err"); }
+    finally { setDetailLoading(false); }
+  };
+
+  const refreshView = async () => {
+    try { setDetail(await API.get(`/admin/tickets/${view.id}`)); }
+    catch (e) { toast(e.message, "err"); }
+  };
+
+  const sendReply = async () => {
+    try {
+      await API.post(`/admin/tickets/${view.id}/reply`, { message: reply });
+      toast("Reply sent"); setReply("");
+      await refreshView(); reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  const toggleStatus = async () => {
+    const closing = detail.ticket.status === "open";
+    try {
+      await API.post(`/admin/tickets/${view.id}/${closing ? "close" : "reopen"}`);
+      toast(closing ? "Ticket closed" : "Ticket reopened");
+      await refreshView(); reload();
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-2">
+        {["open","closed","all"].map(s=>(
+          <Btn key={s} size="sm" variant={status===s?"primary":"ghost"} onClick={()=>setStatus(s)}>
+            {s}</Btn>))}
+      </div>
+
+      {loading ? <Spinner/> : (data?.items||[]).length===0 ? <Empty text="No tickets."/> :
+        <Card className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-neutral-500 border-b border-[#26262c]">
+              <tr><th className="text-left p-3">#</th><th className="text-left p-3">User</th>
+                  <th className="text-left p-3">Subject</th><th className="text-left p-3">Status</th>
+                  <th className="text-left p-3">Updated</th></tr>
+            </thead>
+            <tbody>
+              {data.items.map(tk=>(
+                <tr key={tk.id} className="border-b border-[#1e1e24] last:border-0 hover:bg-[#17171b] cursor-pointer"
+                    onClick={()=>openView(tk)}>
+                  <td className="p-3 font-mono text-xs">{tk.id}</td>
+                  <td className="p-3 truncate max-w-[140px]">{tk.firstName||tk.username||tk.telegramId}</td>
+                  <td className="p-3 truncate max-w-[280px]">{tk.subject}</td>
+                  <td className="p-3"><Badge tone={tk.status==="open"?"green":"gray"}>{tk.status}</Badge></td>
+                  <td className="p-3 text-xs text-neutral-500 whitespace-nowrap">{when(tk.updatedAt)}</td>
+                </tr>))}
+            </tbody>
+          </table>
+        </Card>}
+
+      <Modal open={!!view} onClose={()=>setView(null)} title={`Ticket #${view?.id}`} wide>
+        {detailLoading ? <Spinner/> : detail && (()=>{
+          const tk = detail.ticket;
+          return (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="text-sm">
+                  <span className="text-neutral-200">{tk.firstName||tk.username||tk.telegramId}</span>
+                  <span className="text-neutral-500 font-mono text-xs ml-2">{tk.telegramId}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Badge tone={tk.status==="open"?"green":"gray"}>{tk.status}</Badge>
+                  <Btn size="sm" variant="ghost" onClick={toggleStatus}>
+                    {tk.status==="open" ? "Close" : "Reopen"}</Btn>
+                </div>
+              </div>
+
+              <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
+                {detail.messages.map(m=>(
+                  <div key={m.id} className={`text-sm p-3 rounded-lg ${m.sender==="admin"?"bg-indigo-600/10 ml-6":"bg-[#1a1a1f] mr-6"}`}>
+                    <div className="text-xs text-neutral-500 mb-1">
+                      {m.sender==="admin" ? "Support" : "User"} · {when(m.createdAt)}
+                    </div>
+                    {m.message && <div className="whitespace-pre-wrap">{m.message}</div>}
+                    {m.photoFileId &&
+                      <Btn size="sm" variant="ghost" className="mt-2"
+                        onClick={()=>setPhoto(m.photoFileId)}>📷 View photo</Btn>}
+                  </div>))}
+              </div>
+
+              {tk.status==="open" &&
+                <div className="space-y-2">
+                  <textarea rows={3} value={reply} onChange={e=>setReply(e.target.value)}
+                    placeholder="Reply to this user. HTML allowed: <b>bold</b>, <i>italic</i>."
+                    className="w-full bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-sm
+                               focus:outline-none focus:border-indigo-500"/>
+                  <div className="flex justify-end">
+                    <Btn onClick={sendReply} disabled={!reply.trim()}>Send reply</Btn>
+                  </div>
+                </div>}
+            </div>
+          );
+        })()}
+      </Modal>
+
+      <Modal open={!!photo} onClose={()=>setPhoto(null)} title="Ticket photo" wide>
+        {photo && <img src={API.fileUrl(photo)} className="w-full rounded-lg" alt="ticket attachment"/>}
+      </Modal>
+    </div>
+  );
+}
+
+function PinnedWarning() {
+  const { data, loading, reload } = useApi("/admin/pinned-warnings");
+  const [msg, setMsg] = useState("");
+  const [target, setTarget] = useState("all");
+  const [ids, setIds] = useState("");
+  const toast = useToast();
+
+  const resolveTarget = (t, idsStr) => t === "ids" ? `ids~${idsStr.replace(/\s+/g,"")}` : t;
+
+  const send = async () => {
+    const finalTarget = resolveTarget(target, ids);
+    if (target === "ids" && !ids.trim()) return toast("Enter at least one Telegram ID", "err");
+    if (!confirm(`Send & pin this for "${finalTarget}"? This cannot be undone.`)) return;
+    try {
+      await API.post("/admin/pinned-warnings", { message: msg, target: finalTarget });
+      toast("Pinning started"); setMsg("");
+      setTimeout(reload, 900);
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  const unpin = async (b) => {
+    if (!confirm(`Unpin "${b.message.slice(0,40)}…" for everyone it reached?`)) return;
+    try {
+      await API.post(`/admin/pinned-warnings/${b.id}/unpin`);
+      toast("Unpinning started"); setTimeout(reload, 900);
+    } catch (e) { toast(e.message, "err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-5 space-y-3">
+        <div className="text-sm font-medium">📌 New pinned notice</div>
+        <p className="text-xs text-neutral-500">
+          Sent to the chosen audience and pinned in each of their chats. Use Unpin below to
+          remove it everywhere once it's no longer needed.
+        </p>
+        <textarea rows={5} value={msg} onChange={e=>setMsg(e.target.value)}
+          placeholder="e.g. a payment/anti-fraud warning. HTML allowed: <b>bold</b>, <i>italic</i>."
+          className="w-full bg-[#0f0f12] border border-[#2c2c33] rounded-lg px-3 py-2 text-sm
+                     focus:outline-none focus:border-indigo-500"/>
+        <div className="flex gap-3 items-end flex-wrap">
+          <div className="flex-1 min-w-[160px]">
+            <label className="text-xs text-neutral-400 mb-1 block">Audience</label>
+            <AudienceSelect value={target} onChange={setTarget}/>
+          </div>
+          {target === "ids" &&
+            <div className="flex-[2] min-w-[220px]">
+              <label className="text-xs text-neutral-400 mb-1 block">Telegram IDs (comma-separated)</label>
+              <Input value={ids} onChange={e=>setIds(e.target.value)} placeholder="111111,222222"/>
+            </div>}
+          <Btn onClick={send} disabled={!msg.trim()}>Send & Pin</Btn>
+        </div>
+      </Card>
+
+      {loading ? <Spinner/> :
+        <Card className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-neutral-500 border-b border-[#26262c]">
+              <tr><th className="text-left p-3">Message</th><th className="text-left p-3">Target</th>
+                  <th className="text-right p-3">Sent</th><th className="text-right p-3">Failed</th>
+                  <th className="text-left p-3">Status</th><th className="text-left p-3">When</th>
+                  <th className="p-3"></th></tr>
+            </thead>
+            <tbody>
+              {(data||[]).map(b=>(
+                <tr key={b.id} className="border-b border-[#1e1e24] last:border-0">
+                  <td className="p-3 truncate max-w-[280px]">{b.message}</td>
+                  <td className="p-3 text-neutral-400">{b.target}</td>
+                  <td className="p-3 text-right text-emerald-400">{b.sentCount}</td>
+                  <td className="p-3 text-right text-red-400">{b.failedCount}</td>
+                  <td className="p-3"><Badge tone={b.status==="done"?"green":"amber"}>{b.status}</Badge></td>
+                  <td className="p-3 text-xs text-neutral-500">{when(b.createdAt)}</td>
+                  <td className="p-3 text-right">
+                    {b.active && <Btn size="sm" variant="danger" onClick={()=>unpin(b)}>Unpin</Btn>}
+                  </td>
+                </tr>))}
+            </tbody>
+          </table>
+        </Card>}
+    </div>
+  );
+}
+
+const SETTING_GROUPS = [
+  ["Store", ["store_name","welcome_text","payment_warning_text","support_username","maintenance_mode"]],
+  ["Pricing", ["usdt_rate","min_topup_inr","min_topup_usdt","referral_bonus_percent"]],
+  ["Payment addresses", ["usdt_trc20_address","usdt_bep20_address","usdt_erc20_address","upi_id","binance_pay_id"]],
+  ["Loyalty tiers", ["tier_silver_at","tier_gold_at","tier_silver_discount","tier_gold_discount"]],
+  ["Advanced", ["auto_verify_enabled","upi_qr_file_id"]],
+  ["Force Join Channel", ["force_join_enabled","force_join_channel_url","force_join_channel_id"]],
+  ["Blockchain RPC (payment verification)",
+    ["min_confirmations","min_confirmations_trc20","min_confirmations_bep20","min_confirmations_erc20",
+     "payment_tolerance","payment_ttl_minutes",
+     "bsc_rpc_urls","eth_rpc_urls","tron_api_url","tron_api_key"]],
+  ["Cryptomus Gateway",
+    ["cryptomus_enabled","manual_crypto_enabled","cryptomus_merchant_id","cryptomus_api_key",
+     "cryptomus_network_trc20","cryptomus_network_bep20","cryptomus_network_erc20","public_base_url",
+     "cryptomus_accept_overpayment"]],
+  ["OxaPay Gateway",
+    ["oxapay_enabled","oxapay_merchant_api_key"]],
+];
+
+function Settings() {
+  const { data, loading, reload } = useApi("/admin/settings");
+  const [draft, setDraft] = useState({});
+  const toast = useToast();
+  useEffect(()=>{ if(data) setDraft(data); },[data]);
+
+  const save = async () => {
+    const changed = {};
+    for (const k in draft) if (draft[k] !== data[k]) changed[k] = String(draft[k]);
+    if (!Object.keys(changed).length) return toast("No changes");
+    try { await API.patch("/admin/settings", { values: changed }); toast("Settings saved"); reload(); }
+    catch (e) { toast(e.message,"err"); }
+  };
+
+  if (loading) return <Spinner/>;
+  const dirty = data && Object.keys(draft).some(k => draft[k] !== data[k]);
+
+  return (
+    <div className="space-y-4">
+      {SETTING_GROUPS.map(([group, keys])=>(
+        <Card key={group} className="p-5">
+          <div className="text-sm font-medium mb-4">{group}</div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {keys.filter(k=>k in draft).map(k=>(
+              <div key={k}>
+                <label className="text-xs text-neutral-400 mb-1 block">
+                  {k.replace(/_/g," ")}
+                </label>
+                <Input value={draft[k]??""} onChange={e=>setDraft({...draft,[k]:e.target.value})}
+                  className={k.includes("address")||k==="upi_id"||k.includes("rpc")||k.includes("api") ? "font-mono text-xs" : ""}/>
+              </div>))}
+          </div>
+        </Card>))}
+
+      <div className="sticky bottom-4 flex justify-end">
+        <Btn onClick={save} disabled={!dirty} className="shadow-lg">
+          {dirty ? "Save changes" : "Saved"}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+function Audit() {
+  const { data, loading } = useApi("/admin/audit-logs?limit=100");
+  const [drift, setDrift] = useState(null);
+  const toast = useToast();
+
+  const runAudit = async () => {
+    try {
+      const r = await API.get("/admin/wallet/audit");
+      setDrift(r);
+      toast(r.healthy ? "Ledger is balanced" : `${r.discrepancies.length} discrepancies found`,
+            r.healthy ? "ok" : "err");
+    } catch (e) { toast(e.message,"err"); }
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-5">
+        <div className="flex justify-between items-center gap-4 flex-wrap">
+          <div>
+            <div className="text-sm font-medium">Wallet integrity check</div>
+            <p className="text-xs text-neutral-500 mt-1">
+              Re-derives every balance from the transaction ledger and reports any drift.
+            </p>
+          </div>
+          <Btn onClick={runAudit} variant="ghost">Run check</Btn>
+        </div>
+        {drift && (drift.healthy
+          ? <div className="mt-4 text-sm text-emerald-400">✓ All balances match the ledger.</div>
+          : <div className="mt-4 space-y-1">
+              {drift.discrepancies.map(d=>(
+                <div key={d.userId} className="text-xs font-mono text-red-400">
+                  user {d.userId} ({d.telegramId}): stored {d.stored}, ledger {d.derived}, drift {d.drift}
+                </div>))}
+            </div>)}
+      </Card>
+
+      {loading ? <Spinner/> :
+        <Card className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-neutral-500 border-b border-[#26262c]">
+              <tr><th className="text-left p-3">When</th><th className="text-left p-3">Admin</th>
+                  <th className="text-left p-3">Action</th><th className="text-left p-3">Entity</th>
+                  <th className="text-left p-3">Detail</th></tr>
+            </thead>
+            <tbody>
+              {(data?.items||[]).map(l=>(
+                <tr key={l.id} className="border-b border-[#1e1e24] last:border-0">
+                  <td className="p-3 text-xs text-neutral-500 whitespace-nowrap">{when(l.createdAt)}</td>
+                  <td className="p-3">{l.adminName}</td>
+                  <td className="p-3"><Badge tone={l.action.includes("delete")||l.action.includes("failed")?"red":"gray"}>
+                    {l.action}</Badge></td>
+                  <td className="p-3 text-neutral-400 text-xs">{l.entity}{l.entityId?` #${l.entityId}`:""}</td>
+                  <td className="p-3 text-xs text-neutral-500 font-mono truncate max-w-[200px]">
+                    {l.detail && Object.keys(l.detail).length ? JSON.stringify(l.detail) : "—"}</td>
+                </tr>))}
+            </tbody>
+          </table>
+        </Card>}
+    </div>
+  );
+}
+
+/* ===========================================================================
+   SHELL
+   =========================================================================== */
+
+const NAV = [
+  ["dashboard","Dashboard","▦"], ["payments","Payments","₹"], ["orders","Orders","▢"],
+  ["products","Products","◆"], ["categories","Categories","▤"], ["users","Users","◉"],
+  ["coupons","Coupons","%"], ["broadcast","Broadcast","➤"], ["tickets","Tickets","🎫"],
+  ["pinned","Pin Notice","📌"], ["settings","Settings","⚙"], ["audit","Audit","☰"],
+];
+
+const PAGES = { dashboard:Dashboard, payments:Payments, orders:Orders, products:Products,
+  categories:Categories, users:Users, coupons:Coupons, broadcast:Broadcast,
+  tickets:Tickets, pinned:PinnedWarning, settings:Settings, audit:Audit };
+
+function App() {
+  const [admin, setAdmin] = useState(null);
+  const [page, setPage] = useState("dashboard");
+  const [checking, setChecking] = useState(true);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    const logout = () => setAdmin(null);
+    window.addEventListener("dh:logout", logout);
+    (async () => {
+      if (API.getToken()) {
+        try { setAdmin(await API.get("/admin/me")); } catch {}
+      }
+      setChecking(false);
+    })();
+    return () => window.removeEventListener("dh:logout", logout);
+  }, []);
+
+  if (checking) return <div className="min-h-screen flex items-center justify-center">
+    <div className="w-6 h-6 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"/></div>;
+
+  if (!admin) return <Login onIn={setAdmin}/>;
+
+  const Page = PAGES[page];
+
+  return (
+    <div className="min-h-screen flex">
+      {/* sidebar */}
+      <aside className={`fixed lg:sticky top-0 h-screen w-56 bg-[#0f0f12] border-r border-[#1e1e24]
+        z-40 transition-transform ${open?"translate-x-0":"-translate-x-full lg:translate-x-0"}`}>
+        <div className="p-4 border-b border-[#1e1e24]">
+          <div className="font-semibold">🏪 Digital Hub</div>
+          <div className="text-xs text-neutral-500 mt-0.5">{admin.username} · {admin.role}</div>
+        </div>
+        <nav className="p-2 space-y-0.5">
+          {NAV.map(([k,label,icon])=>(
+            <button key={k} onClick={()=>{setPage(k);setOpen(false);}}
+              className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition
+                ${page===k?"bg-indigo-600/15 text-indigo-300":"text-neutral-400 hover:bg-[#17171b] hover:text-neutral-200"}`}>
+              <span className="w-4 text-center opacity-70">{icon}</span>{label}
+            </button>))}
+        </nav>
+        <div className="absolute bottom-0 left-0 right-0 p-2 border-t border-[#1e1e24]">
+          <button onClick={()=>{API.setToken(null);setAdmin(null);}}
+            className="w-full px-3 py-2 rounded-lg text-sm text-neutral-500 hover:bg-[#17171b] hover:text-red-400 text-left transition">
+            Sign out</button>
+        </div>
+      </aside>
+
+      {open && <div className="fixed inset-0 bg-black/60 z-30 lg:hidden" onClick={()=>setOpen(false)}/>}
+
+      <main className="flex-1 min-w-0">
+        <header className="sticky top-0 z-20 bg-[#0a0a0b]/85 backdrop-blur border-b border-[#1e1e24] px-4 py-3 flex items-center gap-3">
+          <button onClick={()=>setOpen(!open)} className="lg:hidden text-neutral-400 text-xl">☰</button>
+          <h2 className="font-medium capitalize">{page}</h2>
+        </header>
+        <div className="p-4 lg:p-6 max-w-7xl"><Page/></div>
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root"))
+  .render(<ToastHost><App/></ToastHost>);
+</script>
+</body>
+</html>

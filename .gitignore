@@ -1,0 +1,59 @@
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credential*
+*secret*
+*token*
+
+# --- Byte-compiled / cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Distribution / packaging ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Databases / backups ---
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.sql.gz
+backups/
+
+# --- Backup / temp files ---
+*.bak
+*.bak-*
+*.tmp
+*.swp
+*~
+
+# --- Runtime state ---
+.alert_state_*
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
