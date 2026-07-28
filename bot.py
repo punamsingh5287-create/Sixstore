@@ -11389,6 +11389,43 @@ async def healthz():
         raise HTTPException(503, "database unavailable")
 
 
+# ---- frontend telemetry -------------------------------------------------------
+
+class ClientLogIn(BaseModel):
+    level: str = Field(default="error", max_length=32)
+    message: str = Field(max_length=2000)
+    stack: str | None = Field(default=None, max_length=4000)
+    url: str | None = Field(default=None, max_length=500)
+    userAgent: str | None = Field(default=None, max_length=300)
+
+
+# Mini App frontend runtime errors and network failures land here (see
+# src/lib/client-error-reporting.ts) -- unauthenticated on purpose, since a
+# broken/expired initData is itself one of the things that can trigger a
+# report, and we'd rather log a slightly-less-trusted event than lose it.
+# Per-IP token bucket keeps a buggy client loop from flooding the log.
+_client_log_buckets: dict[str, list[float]] = {}
+_CLIENT_LOG_LIMIT = 20
+_CLIENT_LOG_WINDOW_S = 60.0
+
+
+@app.post("/api/store/client-log", status_code=204)
+async def store_client_log(payload: ClientLogIn, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    bucket = _client_log_buckets.setdefault(ip, [])
+    bucket[:] = [t for t in bucket if now - t < _CLIENT_LOG_WINDOW_S]
+    if len(bucket) >= _CLIENT_LOG_LIMIT:
+        return Response(status_code=204)
+    bucket.append(now)
+    log.warning(
+        "frontend %s: %s | url=%s ua=%s%s",
+        payload.level, payload.message, payload.url, payload.userAgent,
+        f"\n{payload.stack}" if payload.stack else "",
+    )
+    return Response(status_code=204)
+
+
 @app.post("/api/telegram/webhook")
 async def telegram_webhook(request: Request):
     if CFG.webhook_secret:
